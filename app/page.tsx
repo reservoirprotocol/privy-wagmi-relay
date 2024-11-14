@@ -1,5 +1,14 @@
 'use client';
 
+import {type LinkedWallet, SwapWidget} from '@reservoir0x/relay-kit-ui';
+import {adaptViemWallet, type AdaptedWallet, type RelayChain} from '@reservoir0x/relay-sdk';
+import {adaptSolanaWallet} from '@reservoir0x/relay-svm-wallet-adapter';
+import {
+  Connection,
+  type SendOptions,
+  type VersionedTransaction,
+  type Transaction as SolanaTransaction,
+} from '@solana/web3.js';
 import Balance from 'components/Balance';
 import BlockNumber from 'components/BlockNumber';
 import Button from 'components/Button';
@@ -23,11 +32,21 @@ import Transaction from 'components/Transaction';
 import WaitForTransaction from 'components/WaitForTransaction';
 import WalletClient from 'components/WalletClient';
 import WatchPendingTransactions from 'components/WatchPendingTransactions';
+import {convertToLinkedWallet} from 'lib/relay';
 import {shorten} from 'lib/utils';
 import Image from 'next/image';
-import {useAccount, useDisconnect} from 'wagmi';
+import {useEffect, useMemo, useRef, useState} from 'react';
+import {zeroAddress} from 'viem';
+import {useAccount, useDisconnect, useWalletClient} from 'wagmi';
 
-import {usePrivy, useWallets} from '@privy-io/react-auth';
+import {
+  type ConnectedWallet,
+  type ConnectedSolanaWallet,
+  useConnectWallet,
+  usePrivy,
+  useWallets,
+  useSolanaWallets,
+} from '@privy-io/react-auth';
 import {useSetActiveWallet} from '@privy-io/wagmi';
 
 import wagmiPrivyLogo from '../public/wagmi_privy_logo.png';
@@ -37,14 +56,90 @@ const MonoLabel = ({label}: {label: string}) => {
 };
 
 export default function Home() {
+  const [wallet, setWallet] = useState<AdaptedWallet | undefined>();
+  const [primaryWallet, setPrimaryWallet] = useState<ConnectedWallet | undefined>();
+  const _walletsRef = useRef<ConnectedWallet[]>();
+  const [linkWalletPromise, setLinkWalletPromise] = useState<
+    | {
+        resolve: (value: LinkedWallet) => void;
+        reject: () => void;
+        params: {chain?: RelayChain; direction: 'to' | 'from'};
+      }
+    | undefined
+  >();
+
   // Privy hooks
-  const {ready, user, authenticated, login, connectWallet, logout, linkWallet} = usePrivy();
+  const {ready, user, authenticated, login, logout, linkWallet} = usePrivy();
+  const {connectWallet} = useConnectWallet({
+    onSuccess: (wallet) => {
+      if (linkWalletPromise) {
+        linkWalletPromise?.resolve(convertToLinkedWallet(wallet as ConnectedWallet));
+        setLinkWalletPromise(undefined);
+      }
+    },
+  });
   const {wallets, ready: walletsReady} = useWallets();
+  const {data: walletClient} = useWalletClient();
+  const {wallets: solanaWallets} = useSolanaWallets();
+  const linkedWallets = useMemo(() => {
+    const _wallets = wallets.reduce((linkedWallets, wallet) => {
+      linkedWallets.push(convertToLinkedWallet(wallet));
+      return linkedWallets;
+    }, [] as LinkedWallet[]);
+    const _solanaWallets = solanaWallets.reduce((linkedWallets, wallet) => {
+      linkedWallets.push(convertToLinkedWallet(wallet as unknown as ConnectedWallet));
+      return linkedWallets;
+    }, [] as LinkedWallet[]);
+    _walletsRef.current = [...solanaWallets, ..._wallets] as unknown as ConnectedWallet[];
+    return [..._wallets, ..._solanaWallets];
+  }, [wallets, solanaWallets]);
 
   // WAGMI hooks
   const {address, isConnected, isConnecting, isDisconnected} = useAccount();
   const {disconnect} = useDisconnect();
   const {setActiveWallet} = useSetActiveWallet();
+
+  useEffect(() => {
+    const adaptWallet = async () => {
+      try {
+        if (primaryWallet) {
+          let adaptedWallet: AdaptedWallet | undefined;
+          if (primaryWallet.chainId) {
+            if (walletClient) {
+              adaptedWallet = adaptViemWallet(walletClient);
+            }
+          } else if (primaryWallet.connectorType.includes('solana')) {
+            const solanaWallet = primaryWallet as unknown as ConnectedSolanaWallet;
+            const connection = new Connection(`${process.env.NEXT_PUBLIC_SOLANA_RPC}`);
+            const signAndSendTransaction = async (
+              transaction: SolanaTransaction | VersionedTransaction,
+              options?: SendOptions,
+            ) => {
+              const signature = await solanaWallet.sendTransaction(
+                transaction,
+                connection,
+                options,
+              );
+              return {signature};
+            };
+
+            adaptedWallet = adaptSolanaWallet(
+              primaryWallet.address,
+              792703809,
+              connection,
+              signAndSendTransaction,
+            );
+          }
+          setWallet(adaptedWallet);
+        } else {
+          setWallet(undefined);
+        }
+      } catch (e) {
+        setWallet(undefined);
+      }
+    };
+    adaptWallet();
+  }, [primaryWallet, walletClient]);
 
   if (!ready) {
     return null;
@@ -83,6 +178,75 @@ export default function Home() {
         </p>
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           <div className="border-1 flex flex-col items-start gap-2 rounded border border-black bg-slate-100 p-3">
+            <h1 className="text-4xl font-bold">RelayKit</h1>
+            <SwapWidget
+              defaultToToken={{
+                chainId: 1,
+                address: zeroAddress,
+                decimals: 18,
+                name: 'ETH',
+                symbol: 'ETH',
+                logoURI: 'https://assets.relay.link/icons/currencies/eth.png',
+              }}
+              defaultFromToken={{
+                chainId: 8453,
+                address: '0x0000000000000000000000000000000000000000',
+                decimals: 18,
+                name: 'ETH',
+                symbol: 'ETH',
+                logoURI: 'https://assets.relay.link/icons/currencies/eth.png',
+              }}
+              wallet={wallet}
+              multiWalletSupportEnabled={true}
+              linkedWallets={linkedWallets}
+              onConnectWallet={() => connectWallet}
+              onLinkNewWallet={({chain, direction}) => {
+                if (linkWalletPromise) {
+                  linkWalletPromise.reject();
+                  setLinkWalletPromise(undefined);
+                }
+                const promise = new Promise<LinkedWallet>((resolve, reject) => {
+                  setLinkWalletPromise({
+                    resolve,
+                    reject,
+                    params: {
+                      chain,
+                      direction,
+                    },
+                  });
+                });
+                connectWallet({});
+                return promise;
+              }}
+              onSetPrimaryWallet={async (address: string) => {
+                //In some cases there's a race condition between connecting the wallet and having it available to switch to so we need to poll for it
+                const maxAttempts = 20;
+                let attemptCount = 0;
+                const timer = setInterval(async () => {
+                  attemptCount++;
+                  const newPrimaryWallet = _walletsRef.current?.find(
+                    (wallet) => wallet.address === address,
+                  );
+                  if (attemptCount >= maxAttempts) {
+                    clearInterval(timer);
+                    return;
+                  }
+                  if (!newPrimaryWallet) {
+                    return;
+                  }
+                  setPrimaryWallet(newPrimaryWallet);
+                  try {
+                    if (newPrimaryWallet.chainId) {
+                      setActiveWallet(newPrimaryWallet);
+                    }
+                    clearInterval(timer);
+                  } catch (e) {}
+                }, 200);
+              }}
+            />
+          </div>
+
+          <div className="border-1 flex flex-col items-start gap-2 rounded border border-black bg-slate-100 p-3">
             <h1 className="text-4xl font-bold">Privy</h1>
             {ready && !authenticated && (
               <>
@@ -94,7 +258,6 @@ export default function Home() {
                 </div>
               </>
             )}
-
             {walletsReady &&
               wallets.map((wallet) => {
                 return (
@@ -114,7 +277,6 @@ export default function Home() {
                   </div>
                 );
               })}
-
             {ready && authenticated && (
               <>
                 <p className="mt-2">You are logged in with privy.</p>

@@ -1,4 +1,5 @@
 import '../styles/globals.css';
+import '@reservoir0x/relay-kit-ui/styles.css';
 
 import Providers from 'components/providers';
 
